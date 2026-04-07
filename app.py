@@ -528,10 +528,68 @@ def analyze(df: pd.DataFrame, anno_bilancio: int, anno_prec: int, anno_succ: int
         'diff': sum_avere_bil - sum_dare_succ,
     }
 
-    # CHECK 4: Righe senza corrispondente
+    # CHECK 4: Righe senza corrispondente (anno_bilancio ↔ anno_succ)
     result['check4'] = {
         'unmatched_avere': unm_avere,
         'unmatched_dare': unm_dare,
+    }
+
+    # ── CHECK 5: Analisi anno precedente ─────────────────────────────────────
+    # Avere al 31/12/anno_prec → stornati in dare anno_bil? in dare anno_succ? mai?
+    avere_prec = righe_avere_31dic(df_prec, anno_prec)
+    dare_bil_storni = righe_dare_inizio_anno(df_bil, anno_bilancio)
+    dare_succ_storni = righe_dare_inizio_anno(df_succ, anno_succ)
+
+    matched_prec_bil, unm_avere_prec, unm_dare_bil_prec = match_cifre(avere_prec, dare_bil_storni)
+
+    if unm_avere_prec:
+        unm_avere_prec_df = pd.DataFrame([{
+            'data_reg': r.data_reg, 'descrizione': r.descrizione,
+            'causale': r.causale, 'dare': r.dare, 'avere': r.avere, 'saldo': r.saldo
+        } for r in unm_avere_prec])
+        matched_prec_succ, still_unmatched_prec, unm_dare_succ_prec = match_cifre(
+            unm_avere_prec_df, dare_succ_storni
+        )
+    else:
+        matched_prec_succ = []
+        still_unmatched_prec = []
+
+    prec_detail = []
+    matched_bil_idx  = {m[0].Index for m in matched_prec_bil}
+    matched_succ_idx = {m[0].Index for m in matched_prec_succ} if matched_prec_succ else set()
+
+    for row in avere_prec.itertuples(index=True):
+        if row.Index in matched_bil_idx:
+            stato = 'OK'
+            note  = f'Stornato regolarmente in {anno_bilancio}'
+            icona = '✅'
+        elif row.Index in matched_succ_idx:
+            stato = 'RITARDO'
+            note  = f'Stornato in {anno_succ} — verificare motivazione'
+            icona = '⚠️'
+        else:
+            stato = 'APERTO'
+            note  = f'Nessuno storno trovato in {anno_bilancio} né in {anno_succ}'
+            icona = '❌'
+        prec_detail.append({
+            'Icona': icona,
+            'Data avere': str(row.data_reg),
+            'Descrizione': row.descrizione,
+            'Avere': row.avere,
+            'Stato': stato,
+            'Note': note,
+        })
+
+    result['check5'] = {
+        'avere_prec': avere_prec,
+        'matched_in_bil': matched_prec_bil,
+        'matched_in_succ': matched_prec_succ,
+        'unmatched': still_unmatched_prec,
+        'detail': prec_detail,
+        'n_ok': sum(1 for r in prec_detail if r['Stato'] == 'OK'),
+        'n_ritardo': sum(1 for r in prec_detail if r['Stato'] == 'RITARDO'),
+        'n_aperto': sum(1 for r in prec_detail if r['Stato'] == 'APERTO'),
+        'ok': sum(1 for r in prec_detail if r['Stato'] == 'APERTO') == 0,
     }
 
     # ── Saldi di riepilogo ───────────────────────────────────────────────────
@@ -750,17 +808,19 @@ def main():
             not res['check2']['ok'],
             not res['check3']['ok'],
             len(res['check4']['unmatched_avere']) + len(res['check4']['unmatched_dare']) > 0,
+            not res['check5']['ok'],
         ])
         st.metric("Anomalie rilevate", n_anomalie,
                   delta="✓ Tutto ok" if n_anomalie == 0 else f"⚠ {n_anomalie} verifica/e",
                   delta_color="normal" if n_anomalie == 0 else "inverse")
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "① Saldo a zero",
         "② Matching cifre",
         "③ Totali",
         "④ Non abbinati",
+        f"⑤ Anno {anno_prec}",
         "📋 Mastrino",
     ])
 
@@ -900,6 +960,44 @@ def main():
                 df_table(pd.DataFrame(rows))
 
     with tab5:
+        st.markdown(f'<div class="section-title">Check 5 · Fatture da ricevere {anno_prec} — situazione storni</div>', unsafe_allow_html=True)
+
+        c5 = res['check5']
+        detail = c5['detail']
+
+        # Riepilogo contatori
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown(f"""
+            <div class="card card-ok" style="text-align:center;">
+              <div class="card-title">Stornati in {anno_bilancio}</div>
+              <div class="card-value">{c5['n_ok']}</div>
+              <div class="card-label">Chiusi regolarmente</div>
+            </div>""", unsafe_allow_html=True)
+        with col_b:
+            cls = 'card-warn' if c5['n_ritardo'] > 0 else 'card-ok'
+            st.markdown(f"""
+            <div class="card {cls}" style="text-align:center;">
+              <div class="card-title">Stornati in {anno_succ}</div>
+              <div class="card-value">{c5['n_ritardo']}</div>
+              <div class="card-label">Verificare motivazione</div>
+            </div>""", unsafe_allow_html=True)
+        with col_c:
+            cls = 'card-error' if c5['n_aperto'] > 0 else 'card-ok'
+            st.markdown(f"""
+            <div class="card {cls}" style="text-align:center;">
+              <div class="card-title">Mai stornati</div>
+              <div class="card-value">{c5['n_aperto']}</div>
+              <div class="card-label">Anomalia — da verificare</div>
+            </div>""", unsafe_allow_html=True)
+
+        if detail:
+            st.markdown(f"**Dettaglio righe avere al 31/12/{anno_prec}:**")
+            df_table(pd.DataFrame(detail))
+        else:
+            st.info(f"Nessuna riga avere trovata al 31/12/{anno_prec}.")
+
+    with tab6:
         st.markdown('<div class="section-title">Mastrino completo caricato</div>', unsafe_allow_html=True)
 
         # Filtro per anno
